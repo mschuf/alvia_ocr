@@ -48,6 +48,7 @@ export class OcrService {
     filePath: string,
     empresaId?: number,
     useSlowModel = false, // Permite elegir modelo lento si es necesario
+    uploadedMimeType?: string,
   ): Promise<OcrResponseDto> {
     const startTime = Date.now();
 
@@ -67,16 +68,22 @@ export class OcrService {
         );
       }
 
-      let fileBuffer = await FileUtils.readFileAsBuffer(filePath);
+      const fileBuffer = await FileUtils.readFileAsBuffer(filePath);
       const ext = path.extname(filePath).toLowerCase();
+      const normalizedMimeType = (uploadedMimeType || '').toLowerCase();
       let mimeType: string;
 
-      if (ext === '.pdf') {
+      if (normalizedMimeType === 'application/pdf' || ext === '.pdf') {
         mimeType = 'application/pdf';
         this.logger.log('Processing PDF file');
+      } else if (normalizedMimeType.startsWith('image/')) {
+        mimeType = normalizedMimeType;
+        this.logger.log(`Processing image file (${mimeType})`);
       } else {
         mimeType = 'image/jpeg';
-        this.logger.log('Processing image file');
+        this.logger.log(
+          'Processing image file (fallback image/jpeg by extension)',
+        );
       }
 
       // OPTIMIZACIÓN 3: Obtener prompt

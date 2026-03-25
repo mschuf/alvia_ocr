@@ -115,6 +115,8 @@ export class OcrController {
       const result = await this.ocrService.processInvoiceFromFile(
         file.path,
         resolvedEmpresaId,
+        false,
+        file.mimetype,
       );
       return result;
     } catch (error) {
