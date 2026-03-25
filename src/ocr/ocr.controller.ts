@@ -50,10 +50,17 @@ export class OcrController {
     },
   })
   @ApiQuery({
+    name: 'empresaId',
+    required: false,
+    type: 'string',
+    description: 'ID de empresa para obtener prompt activo personalizado',
+  })
+  @ApiQuery({
     name: 'dbName',
     required: false,
     type: 'string',
-    description: 'Nombre de la base de datos para obtener prompt personalizado',
+    description:
+      'Parametro legado. Si llega, se interpreta como empresaId para compatibilidad',
   })
   @ApiResponse({
     status: 200,
@@ -66,6 +73,7 @@ export class OcrController {
   })
   async processInvoice(
     @UploadedFile() file: Express.Multer.File,
+    @Query('empresaId') empresaId?: string,
     @Query('dbName') dbName?: string,
   ): Promise<OcrResponseDto> {
     this.logger.log('Processing invoice');
@@ -83,13 +91,30 @@ export class OcrController {
     }
 
     try {
+      const empresaIdParam = empresaId ?? dbName;
+      let resolvedEmpresaId: number | undefined;
+
+      if (empresaIdParam !== undefined) {
+        const parsedEmpresaId = Number(empresaIdParam);
+        if (
+          !Number.isFinite(parsedEmpresaId) ||
+          parsedEmpresaId <= 0 ||
+          !Number.isInteger(parsedEmpresaId)
+        ) {
+          throw new BadRequestException(
+            'empresaId debe ser un numero entero mayor a 0',
+          );
+        }
+        resolvedEmpresaId = parsedEmpresaId;
+      }
+
       this.logger.log(
         `Delegating processing to OCR service for file: ${file.path}`,
       );
       // Delegar el procesamiento al servicio
       const result = await this.ocrService.processInvoiceFromFile(
         file.path,
-        dbName,
+        resolvedEmpresaId,
       );
       return result;
     } catch (error) {

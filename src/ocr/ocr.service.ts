@@ -46,7 +46,7 @@ export class OcrService {
 
   async processInvoiceFromFile(
     filePath: string,
-    dbName?: string,
+    empresaId?: number,
     useSlowModel = false, // Permite elegir modelo lento si es necesario
   ): Promise<OcrResponseDto> {
     const startTime = Date.now();
@@ -80,7 +80,7 @@ export class OcrService {
       }
 
       // OPTIMIZACIÓN 3: Obtener prompt
-      const prompt = await this.generatePrompt(dbName);
+      const prompt = await this.generatePrompt(empresaId);
 
       this.logger.log(`Generated prompt 1: ${prompt}`);
 
@@ -91,7 +91,7 @@ export class OcrService {
         fileBuffer,
         mimeType,
         modelToUse,
-        dbName,
+        empresaId ? `empresaId:${empresaId}` : undefined,
       );
 
       const extractedData = this.parseGeminiResponse(text);
@@ -157,7 +157,7 @@ export class OcrService {
     buffer?: Buffer,
     mimeType?: string,
     modelName?: string,
-    dbName?: string,
+    contextLabel?: string,
   ): Promise<any> {
     try {
       const model = modelName || this.geminiModel;
@@ -204,8 +204,8 @@ export class OcrService {
 
       const response = await result.response;
 
-      // Log del model response en archivo mensual con dbName
-      LogUtils.logModelResponse(response, dbName);
+      // Log del model response en archivo mensual con contexto
+      LogUtils.logModelResponse(response, contextLabel);
 
       this.logger.log(`Model response received ${JSON.stringify(response)}`);
 
@@ -224,9 +224,9 @@ export class OcrService {
   /**
    * Obtiene prompt personalizado con timeout
    */
-  private async fetchCustomPrompt(dbName: string): Promise<string | null> {
+  private async fetchCustomPrompt(empresaId: number): Promise<string | null> {
     try {
-      this.logger.log(`Fetching custom prompt for: ${dbName}`);
+      this.logger.log(`Fetching custom prompt for empresaId: ${empresaId}`);
       const baseUrl = process.env.API_BASE_URL || 'http://localhost:3003';
 
       // OPTIMIZACIÓN 9: Agregar timeout al fetch
@@ -234,7 +234,7 @@ export class OcrService {
       const timeoutId = setTimeout(() => controller.abort(), 3000); // 3s timeout
 
       const response = await fetch(
-        `${baseUrl}/esquema-prompts/active/${dbName}`,
+        `${baseUrl}/prompts/active-by-empresa/${empresaId}`,
         { signal: controller.signal },
       );
 
@@ -253,11 +253,11 @@ export class OcrService {
     }
   }
 
-  private async generatePrompt(dbName?: string): Promise<string> {
-    // Intentar obtener prompt personalizado solo si se especifica dbName
+  private async generatePrompt(empresaId?: number): Promise<string> {
+    // Intentar obtener prompt personalizado solo si se especifica empresaId
     let customPrompt: string | null = null;
-    if (dbName) {
-      customPrompt = await this.fetchCustomPrompt(dbName);
+    if (empresaId) {
+      customPrompt = await this.fetchCustomPrompt(empresaId);
     }
 
     // OPTIMIZACIÓN 10: Prompt más conciso y directo
