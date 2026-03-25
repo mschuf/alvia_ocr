@@ -12,7 +12,7 @@ import {
 import { FileInterceptor } from '@nestjs/platform-express';
 import { OcrService } from './ocr.service';
 import { OcrResponseDto } from './dto/ocr-response.dto';
-import { Express } from 'express';
+import type { Express } from 'express';
 import { multerConfig } from './ocr.config';
 import { FileStreamInterceptor } from './interceptors/file-stream.interceptor';
 import {
