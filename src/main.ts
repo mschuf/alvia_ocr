@@ -1,17 +1,28 @@
-import { NestFactory } from '@nestjs/core';
-import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
+import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
-import { HttpExceptionFilter } from './common/filters/http-exception.filter'; // Excepción global personalizada
+import { json, urlencoded } from 'express';
 import * as dotenv from 'dotenv';
+import { AppModule } from './app.module';
+import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 
-// Load environment variables
 dotenv.config();
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
-  // Configure global pipes
+  // Importante para /ocr/process-daemon: el documento puede venir en base64 largo.
+  const bodyLimit = process.env.OCR_HTTP_BODY_LIMIT ?? '80mb';
+  app.use(json({ limit: bodyLimit }));
+  app.use(urlencoded({ limit: bodyLimit, extended: true }));
+
+  app.enableCors({
+    origin: '*',
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
+    allowedHeaders: '*',
+    credentials: true,
+  });
+
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
@@ -20,36 +31,19 @@ async function bootstrap() {
     }),
   );
 
-  // 🔹 Habilitar CORS para todas las IPs
-  app.enableCors({
-    origin: '*', // Permite cualquier origen
-    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
-    allowedHeaders: '*',
-    credentials: true, // Habilitar credenciales
-  });
+  app.useGlobalFilters(new HttpExceptionFilter());
 
-  // Configure Swagger
   const config = new DocumentBuilder()
     .setTitle('OCR Backend API')
-    .setDescription('API para extracción de datos de facturas')
+    .setDescription('API para extraccion de datos de facturas')
     .setVersion('1.0')
     .addTag('OCR')
     .build();
+
   const document = SwaggerModule.createDocument(app, config);
   SwaggerModule.setup('api', app, document);
 
-  // 🔹 Habilitar validaciones globales
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true, // Elimina propiedades no definidas en los DTOs
-      forbidNonWhitelisted: true, // Rechaza peticiones con propiedades no permitidas
-      transform: true, // Convierte los valores de la petición en los tipos de los DTOs
-    }),
-  );
-
-  // 🔹 Manejo de errores global con un filtro personalizado
-  app.useGlobalFilters(new HttpExceptionFilter());
-
   await app.listen(process.env.PORT ?? 3000);
 }
-bootstrap();
+
+void bootstrap();
