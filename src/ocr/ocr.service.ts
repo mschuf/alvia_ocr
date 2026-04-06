@@ -1,25 +1,41 @@
 import {
+  BadRequestException,
   Injectable,
   InternalServerErrorException,
   Logger,
-  BadRequestException,
 } from '@nestjs/common';
-import { OcrResponseDto } from './dto/ocr-response.dto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { constants } from 'node:fs';
+import * as fs from 'node:fs';
+import { access, readFile } from 'node:fs/promises';
+import * as path from 'node:path';
+import { OcrResponseDto } from './dto/ocr-response.dto';
 import { FileUtils } from './utils/file.utils';
 import { LogUtils } from './utils/log.utils';
-import * as fs from 'fs';
-import * as path from 'path';
+
+interface DaemonProcessRequest {
+  documentValue: string;
+  empresaId: number;
+  prompt: string;
+  useSlowModel?: boolean;
+  documentId?: number;
+}
+
+interface ResolvedDocumentInput {
+  mimeType: string;
+  buffer: Buffer;
+  source: 'data_uri' | 'url' | 'file_path' | 'base64_text';
+}
 
 @Injectable()
 export class OcrService {
   private readonly logger = new Logger(OcrService.name);
-  private genAI: GoogleGenerativeAI;
+  private readonly genAI: GoogleGenerativeAI;
 
-  // OPTIMIZACIÓN 1: Usar modelo más rápido por defecto
-  private readonly geminiModel: string = 'gemini-3-flash-preview'; // Mucho más rápido
-  //private readonly geminiModel: string = 'gemini-3-pro-preview'; // Mucho más rápido
-  private readonly geminiSlowModel: string = 'gemini-2.5-flash'; // Para casos complejos
+  // Se mantienen modelos internos del OCR, no del daemon.
+  private readonly geminiModel = 'gemini-3-flash-preview';
+  private readonly geminiSlowModel = 'gemini-2.5-flash';
+  private readonly maxFileSizeBytes = 50 * 1024 * 1024;
 
   constructor() {
     try {
@@ -44,10 +60,57 @@ export class OcrService {
     }
   }
 
+  async processInvoiceFromDaemon(
+    request: DaemonProcessRequest,
+  ): Promise<Record<string, unknown>> {
+    const { documentValue, empresaId, prompt, documentId } = request;
+    const useSlowModel = request.useSlowModel ?? false;
+    const startTime = Date.now();
+
+    if (!Number.isInteger(empresaId) || empresaId <= 0) {
+      throw new BadRequestException(
+        'empresaId es obligatorio y debe ser entero mayor a 0',
+      );
+    }
+
+    if (!prompt.trim()) {
+      throw new BadRequestException(
+        'prompt es obligatorio para process-daemon',
+      );
+    }
+
+    const resolvedInput = await this.resolveDocumentInput(documentValue);
+    this.validateBufferSize(resolvedInput.buffer.length);
+
+    const modelToUse = useSlowModel ? this.geminiSlowModel : this.geminiModel;
+    const contextLabel = `daemon:empresaId:${empresaId},documentId:${documentId ?? 'N/A'},source:${resolvedInput.source}`;
+
+    this.logger.log(
+      `Processing daemon OCR request with ${resolvedInput.source}, mime=${resolvedInput.mimeType}, bytes=${resolvedInput.buffer.length}`,
+    );
+
+    const text = await this.processWithGemini(
+      prompt,
+      resolvedInput.buffer,
+      resolvedInput.mimeType,
+      modelToUse,
+      contextLabel,
+    );
+
+    const extractedData = this.parseGeminiResponse(text);
+    extractedData.timestamp = new Date().toISOString();
+    extractedData.empresaId = empresaId;
+
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+    this.logger.log(`Daemon OCR processed in ${duration}s`);
+
+    return extractedData;
+  }
+
   async processInvoiceFromFile(
     filePath: string,
     empresaId?: number,
-    useSlowModel = false, // Permite elegir modelo lento si es necesario
+    useSlowModel = false,
     uploadedMimeType?: string,
   ): Promise<OcrResponseDto> {
     const startTime = Date.now();
@@ -61,75 +124,81 @@ export class OcrService {
 
       const fileSize = await FileUtils.getFileSize(filePath);
       this.logger.log(`File size: ${(fileSize / 1024).toFixed(2)} KB`);
-
-      if (fileSize > 50 * 1024 * 1024) {
-        throw new BadRequestException(
-          'El archivo es demasiado grande. El tamaño máximo permitido es 50MB.',
-        );
-      }
+      this.validateBufferSize(fileSize);
 
       const fileBuffer = await FileUtils.readFileAsBuffer(filePath);
-      const ext = path.extname(filePath).toLowerCase();
-      const normalizedMimeType = (uploadedMimeType || '').toLowerCase();
-      let mimeType: string;
-
-      if (normalizedMimeType === 'application/pdf' || ext === '.pdf') {
-        mimeType = 'application/pdf';
-        this.logger.log('Processing PDF file');
-      } else if (normalizedMimeType.startsWith('image/')) {
-        mimeType = normalizedMimeType;
-        this.logger.log(`Processing image file (${mimeType})`);
-      } else {
-        mimeType = 'image/jpeg';
-        this.logger.log(
-          'Processing image file (fallback image/jpeg by extension)',
-        );
-      }
-
-      // OPTIMIZACIÓN 3: Obtener prompt
+      const mimeType = this.resolveMimeTypeFromUpload(
+        filePath,
+        uploadedMimeType,
+      );
       const prompt = await this.generatePrompt(empresaId);
-
-      this.logger.log(`Generated prompt 1: ${prompt}`);
-
-      // OPTIMIZACIÓN 4: Usar modelo apropiado
       const modelToUse = useSlowModel ? this.geminiSlowModel : this.geminiModel;
+
       const text = await this.processWithGemini(
         prompt,
         fileBuffer,
         mimeType,
         modelToUse,
-        empresaId ? `empresaId:${empresaId}` : undefined,
+        empresaId ? `file:empresaId:${empresaId}` : 'file:empresaId:N/A',
       );
 
       const extractedData = this.parseGeminiResponse(text);
-
-      this.logger.log('Extracted data:', extractedData);
-
       extractedData.timestamp = new Date().toISOString();
 
       await FileUtils.deleteFile(filePath);
 
       const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-      this.logger.log(`✅ Total processing time: ${duration}s`);
+      this.logger.log(`Total processing time: ${duration}s`);
 
-      return extractedData;
+      return this.toOcrResponseDto(extractedData);
     } catch (error) {
       if (FileUtils.fileExists(filePath)) {
         await FileUtils.deleteFile(filePath);
       }
 
-      this.logger.error(`Error processing file: ${error.message}`);
+      const errorMessage =
+        error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Error processing file: ${errorMessage}`);
       throw error;
     }
   }
 
-  /**
-   * OPTIMIZACIÓN 5: Parse optimizado con manejo robusto
-   */
-  private parseGeminiResponse(text: string): OcrResponseDto {
+  async processInvoiceImage(imageBuffer: Buffer): Promise<OcrResponseDto> {
+    const startTime = Date.now();
+
+    try {
+      this.logger.log('Processing invoice image');
+      this.validateBufferSize(imageBuffer.length);
+
+      const prompt = await this.generatePrompt();
+      const text = await this.processWithGemini(
+        prompt,
+        imageBuffer,
+        'image/jpeg',
+        this.geminiModel,
+        'image:empresaId:N/A',
+      );
+
+      const extractedData = this.parseGeminiResponse(text);
+      extractedData.timestamp = new Date().toISOString();
+
+      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+      this.logger.log(`Total time: ${duration}s`);
+
+      return this.toOcrResponseDto(extractedData);
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Error processing invoice image: ${errorMessage}`);
+      throw new InternalServerErrorException(
+        `Error processing invoice: ${errorMessage}`,
+      );
+    }
+  }
+
+  private parseGeminiResponse(text: string): Record<string, unknown> {
     let jsonString = text.trim();
 
-    // Limpieza rápida de markdown
     if (jsonString.startsWith('```json')) {
       jsonString = jsonString.substring(7, jsonString.length - 3);
     } else if (jsonString.startsWith('```')) {
@@ -137,35 +206,34 @@ export class OcrService {
     }
 
     try {
-      return JSON.parse(jsonString);
+      return JSON.parse(jsonString) as Record<string, unknown>;
     } catch (parseError) {
       this.logger.warn('Initial parse failed, attempting cleanup');
 
-      // Limpieza profunda solo si falla el parse inicial
       const cleanedJson = this.cleanJsonResponse(jsonString);
       try {
-        return JSON.parse(cleanedJson);
-      } catch (cleanedParseError) {
-        this.logger.error('Parse failed after cleaning:', {
+        return JSON.parse(cleanedJson) as Record<string, unknown>;
+      } catch {
+        this.logger.error('Parse failed after cleaning', {
           sample: cleanedJson.substring(0, 200),
         });
+
+        const message =
+          parseError instanceof Error ? parseError.message : 'Parse error';
         throw new InternalServerErrorException(
-          'Error parsing OCR response: ' + parseError.message,
+          `Error parsing OCR response: ${message}`,
         );
       }
     }
   }
 
-  /**
-   * OPTIMIZACIÓN 7: Configuración de generación optimizada
-   */
   private async processWithGemini(
     prompt: string,
     buffer?: Buffer,
     mimeType?: string,
     modelName?: string,
     contextLabel?: string,
-  ): Promise<any> {
+  ): Promise<string> {
     try {
       const model = modelName || this.geminiModel;
       this.logger.log(`Processing with model: ${model}`);
@@ -173,35 +241,29 @@ export class OcrService {
       const genModel = this.genAI.getGenerativeModel({
         model,
         generationConfig: {
-          temperature: 0, // Ligeramente más alto para mejor fluidez
-          maxOutputTokens: 15000, // Limitar tokens para respuestas más rápidas
+          temperature: 0,
+          maxOutputTokens: 15000,
           topP: 0.1,
           topK: 1,
-          responseMimeType: 'application/json', // Forzar respuesta JSON directa
+          responseMimeType: 'application/json',
         },
       });
 
-      let content: any;
-      if (buffer && mimeType) {
-        content = [
-          { text: prompt },
-          {
-            inlineData: {
-              mimeType,
-              data: buffer.toString('base64'),
-            },
-          },
-        ];
-      } else {
-        content = prompt;
-      }
+      const content =
+        buffer && mimeType
+          ? [
+              { text: prompt },
+              {
+                inlineData: {
+                  mimeType,
+                  data: buffer.toString('base64'),
+                },
+              },
+            ]
+          : prompt;
 
       const startTime = Date.now();
-
-      // OPTIMIZACIÓN 8: Usar generateContentStream para obtener resultados más rápido
       const result = await genModel.generateContentStream(content);
-      //const result = await genModel.generateContent(content);
-
       const duration = ((Date.now() - startTime) / 1000).toFixed(2);
 
       fs.appendFileSync(
@@ -210,35 +272,28 @@ export class OcrService {
       );
 
       const response = await result.response;
-
-      // Log del model response en archivo mensual con contexto
       LogUtils.logModelResponse(response, contextLabel);
 
-      this.logger.log(`Model response received ${JSON.stringify(response)}`);
-
       const text = response.text();
-
-      this.logger.log(`✅ Model processing: ${duration}s`);
+      this.logger.log(`Model processing: ${duration}s`);
       return text;
     } catch (error) {
-      this.logger.error(`Model failed: ${error.message}`);
+      const errorMessage =
+        error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Model failed: ${errorMessage}`);
       throw new InternalServerErrorException(
-        `Failed to process with model: ${error.message}`,
+        `Failed to process with model: ${errorMessage}`,
       );
     }
   }
 
-  /**
-   * Obtiene prompt personalizado con timeout
-   */
   private async fetchCustomPrompt(empresaId: number): Promise<string | null> {
     try {
       this.logger.log(`Fetching custom prompt for empresaId: ${empresaId}`);
       const baseUrl = process.env.API_BASE_URL || 'http://localhost:3003';
 
-      // OPTIMIZACIÓN 9: Agregar timeout al fetch
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3000); // 3s timeout
+      const timeoutId = setTimeout(() => controller.abort(), 3000);
 
       const response = await fetch(
         `${baseUrl}/prompts/active-by-empresa/${empresaId}`,
@@ -252,102 +307,184 @@ export class OcrService {
         return null;
       }
 
-      const data = await response.json();
-      return data.prompt || null;
+      const data = (await response.json()) as Record<string, unknown>;
+      return typeof data.prompt === 'string' ? data.prompt : null;
     } catch (error) {
-      this.logger.error(`Error fetching custom prompt: ${error.message}`);
+      const errorMessage =
+        error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Error fetching custom prompt: ${errorMessage}`);
       return null;
     }
   }
 
   private async generatePrompt(empresaId?: number): Promise<string> {
-    // Intentar obtener prompt personalizado solo si se especifica empresaId
     let customPrompt: string | null = null;
     if (empresaId) {
       customPrompt = await this.fetchCustomPrompt(empresaId);
     }
 
-    // OPTIMIZACIÓN 10: Prompt más conciso y directo
-    const basePrompt = `Analiza esta factura paraguaya y extrae datos en JSON válido.
+    const basePrompt = `Analiza esta factura paraguaya y extrae datos en JSON valido.
 
-      CAMPOS REQUERIDOS:
-      - invoiceNumber: Número completo de factura (XXX-XXX-XXXXXXX)
-      - establecimiento: Primer segmento del número de factura (3 dígitos)
-      - punto_emision: Segundo segmento del número de factura (3 dígitos)
-      - supplierRuc: RUC del proveedor
-      - supplierName: Nombre del proveedor
-      - CardCode: RUC del cliente
-      - CardName: Nombre del cliente
-      - DocDate: Fecha del documento (DD/MM/YYYY)
-      - DocDueDate: Fecha de vencimiento (DD/MM/YYYY)
-      - DocCurrency: Moneda (PYG/USD)
-      - DocTotal: Total del documento
-      - TaxDate: Fecha de impuesto
-      - U_TIMB: Número de timbrado
-      - U_TimbradoStart: Fecha inicio timbrado
-      - U_TimbradoEnd: Fecha fin timbrado
-      - U_TipoFactura: Tipo de factura
-      - PaymentGroupCode: Código de grupo de pago
-      - DocumentLines: Array de líneas del documento
+CAMPOS REQUERIDOS:
+- invoiceNumber
+- establecimiento
+- punto_emision
+- supplierRuc
+- supplierName
+- CardCode
+- CardName
+- DocDate
+- DocDueDate
+- DocCurrency
+- DocTotal
+- TaxDate
+- U_TIMB
+- U_TimbradoStart
+- U_TimbradoEnd
+- U_TipoFactura
+- PaymentGroupCode
+- DocumentLines
 
-      REGLAS CRÍTICAS:
-      1. RUC: NNNNNNN-N (7-8 dígitos + guión + verificador)
-      2. TipoFactura: "1"=estándar, "2"=virtual, "3"=electrónica
-      3. IVA Paraguay: 10%, 5%, o exento
-      4. supplierRuc ≠ CardCode
-      5. DocTotal = Subtotal + IVA
-      6. Montos PYG sin decimales
-
-      RESPONDE SOLO JSON:`;
+RESPONDE SOLO JSON VALIDO.`;
 
     return customPrompt || basePrompt;
   }
 
-  async processInvoiceImage(imageBuffer: Buffer): Promise<OcrResponseDto> {
-    const startTime = Date.now();
-
-    try {
-      this.logger.log('Processing invoice image');
-
-      if (imageBuffer.length > 50 * 1024 * 1024) {
-        throw new BadRequestException(
-          'El archivo es demasiado grande. Max: 50MB',
-        );
-      }
-
-      const prompt = await this.generatePrompt();
-
-      this.logger.log(`Generated prompt 2: ${prompt}`);
-
-      const text = await this.processWithGemini(
-        prompt,
-        imageBuffer,
-        'image/jpeg',
-      );
-
-      const extractedData = this.parseGeminiResponse(text);
-      extractedData.timestamp = new Date().toISOString();
-
-      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-      this.logger.log(`✅ Total time: ${duration}s`);
-
-      return extractedData;
-    } catch (error) {
-      this.logger.error('Error processing invoice:', error);
-      throw new InternalServerErrorException(
-        'Error processing invoice: ' + (error.message || 'Unknown'),
-      );
-    }
-  }
-
-  // Mantener métodos de limpieza originales...
   private cleanJsonResponse(jsonString: string): string {
-    // Tu implementación original aquí
     let cleaned = jsonString.substring(jsonString.indexOf('{'));
     const lastBraceIndex = cleaned.lastIndexOf('}');
     if (lastBraceIndex !== -1) {
       cleaned = cleaned.substring(0, lastBraceIndex + 1);
     }
     return cleaned;
+  }
+
+  private resolveMimeTypeFromUpload(
+    filePath: string,
+    uploadedMimeType?: string,
+  ): string {
+    const ext = path.extname(filePath).toLowerCase();
+    const normalizedMimeType = (uploadedMimeType || '').toLowerCase();
+
+    if (normalizedMimeType === 'application/pdf' || ext === '.pdf') {
+      return 'application/pdf';
+    }
+    if (normalizedMimeType.startsWith('image/')) {
+      return normalizedMimeType;
+    }
+    return 'image/jpeg';
+  }
+
+  private async resolveDocumentInput(
+    documentValue: string,
+  ): Promise<ResolvedDocumentInput> {
+    const trimmed = documentValue.trim();
+    if (!trimmed) {
+      throw new BadRequestException('documento vacio');
+    }
+
+    const dataUriMatch = trimmed.match(/^data:([^;]+);base64,(.+)$/s);
+    if (dataUriMatch) {
+      const [, mimeType, data] = dataUriMatch;
+      return {
+        mimeType,
+        buffer: Buffer.from(this.sanitizeBase64(data), 'base64'),
+        source: 'data_uri',
+      };
+    }
+
+    if (/^https?:\/\//i.test(trimmed)) {
+      const response = await fetch(trimmed);
+      if (!response.ok) {
+        throw new BadRequestException(
+          `No se pudo descargar documento URL (${response.status})`,
+        );
+      }
+
+      const mimeType = (
+        response.headers.get('content-type') ?? 'application/pdf'
+      )
+        .split(';')[0]
+        .trim();
+
+      return {
+        mimeType,
+        buffer: Buffer.from(await response.arrayBuffer()),
+        source: 'url',
+      };
+    }
+
+    if (await this.pathExists(trimmed)) {
+      const buffer = await readFile(trimmed);
+      return {
+        mimeType: this.guessMimeTypeFromPath(trimmed),
+        buffer,
+        source: 'file_path',
+      };
+    }
+
+    if (this.looksLikeBase64(trimmed)) {
+      return {
+        mimeType: 'application/pdf',
+        buffer: Buffer.from(this.sanitizeBase64(trimmed), 'base64'),
+        source: 'base64_text',
+      };
+    }
+
+    throw new BadRequestException('Formato de documento no soportado');
+  }
+
+  private validateBufferSize(size: number): void {
+    if (size > this.maxFileSizeBytes) {
+      throw new BadRequestException(
+        'El archivo es demasiado grande. El tamaño máximo permitido es 50MB.',
+      );
+    }
+  }
+
+  private async pathExists(pathValue: string): Promise<boolean> {
+    try {
+      await access(pathValue, constants.F_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private sanitizeBase64(value: string): string {
+    return value.replace(/\s/g, '');
+  }
+
+  private looksLikeBase64(value: string): boolean {
+    if (value.length < 32) {
+      return false;
+    }
+    return /^[A-Za-z0-9+/=\s]+$/.test(value);
+  }
+
+  private guessMimeTypeFromPath(pathValue: string): string {
+    const extension = path.extname(pathValue).toLowerCase();
+    if (extension === '.pdf') {
+      return 'application/pdf';
+    }
+    if (extension === '.png') {
+      return 'image/png';
+    }
+    if (extension === '.jpg' || extension === '.jpeg') {
+      return 'image/jpeg';
+    }
+    return 'application/octet-stream';
+  }
+
+  private toOcrResponseDto(data: Record<string, unknown>): OcrResponseDto {
+    const timestamp =
+      typeof data.timestamp === 'string'
+        ? data.timestamp
+        : new Date().toISOString();
+
+    return {
+      ...(data as unknown as OcrResponseDto),
+      timestamp,
+    };
   }
 }

@@ -1,4 +1,5 @@
 import {
+  Body,
   Controller,
   Post,
   UploadedFile,
@@ -23,6 +24,7 @@ import {
   ApiQuery,
   ApiResponse,
 } from '@nestjs/swagger';
+import { ProcessDaemonOcrDto } from './dto/process-daemon-ocr.dto';
 
 @ApiTags('OCR')
 @Controller('ocr')
@@ -30,6 +32,36 @@ export class OcrController {
   private readonly logger = new Logger(OcrController.name);
 
   constructor(private readonly ocrService: OcrService) {}
+
+  @Post('process-daemon')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Procesar OCR para daemon (JSON)',
+    description:
+      'Endpoint para alvia_daemon. Requiere empresaId, prompt y documento original.',
+  })
+  @ApiBody({
+    type: ProcessDaemonOcrDto,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'OCR procesado exitosamente para daemon.',
+  })
+  async processForDaemon(
+    @Body() body: ProcessDaemonOcrDto,
+  ): Promise<Record<string, unknown>> {
+    this.logger.log(
+      `Processing daemon OCR request. empresaId=${body.empresaId}, documentId=${body.documentId ?? 'N/A'}`,
+    );
+
+    return this.ocrService.processInvoiceFromDaemon({
+      documentValue: body.documento,
+      empresaId: body.empresaId,
+      prompt: body.prompt,
+      useSlowModel: body.useSlowModel ?? false,
+      documentId: body.documentId,
+    });
+  }
 
   // Endpoint unificado que acepta archivos en ambos campos "file" o "image"
   @Post('process')
@@ -119,10 +151,13 @@ export class OcrController {
         file.mimetype,
       );
       return result;
-    } catch (error) {
+    } catch (error: unknown) {
+      const errorMessage =
+        error instanceof Error ? error.message : 'Unknown error';
+      const errorStack = error instanceof Error ? error.stack : undefined;
       this.logger.error(
-        `Error processing invoice: ${error.message}`,
-        error.stack,
+        `Error processing invoice: ${errorMessage}`,
+        errorStack,
       );
       throw error;
     }

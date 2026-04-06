@@ -43,7 +43,8 @@ export const multerConfig: MulterOptions = {
     filename: (req, file, callback) => {
       const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
       const originalExt = extname(file.originalname || '').toLowerCase();
-      const fallbackExt = mimeToExtension[(file.mimetype || '').toLowerCase()] || '';
+      const fallbackExt =
+        mimeToExtension[(file.mimetype || '').toLowerCase()] || '';
       const finalExt = originalExt || fallbackExt;
 
       callback(null, `${file.fieldname}-${uniqueSuffix}${finalExt}`);
