@@ -1,5 +1,5 @@
-import * as fs from 'fs';
-import * as path from 'path';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 export class LogUtils {
   private static readonly LOGS_DIR = './logs';
@@ -47,12 +47,29 @@ export class LogUtils {
   }
 
   /**
-   * Escribe un log de Model Response en el archivo mensual
-   * Formato: [YYYY-MM-DD HH:mm:ss] [dbName: XXX] Model response received: {response}
-   * @param response La respuesta del modelo a registrar
-   * @param dbName El nombre de la base de datos (opcional)
+   * Convierte un objeto a string JSON de forma segura
    */
-  static logModelResponse(response: any, dbName?: string): void {
+  private static safeStringify(data: unknown): string {
+    if (typeof data === 'string') {
+      return data;
+    }
+
+    try {
+      return JSON.stringify(data);
+    } catch {
+      return '[unserializable_data]';
+    }
+  }
+
+  /**
+   * Escribe un log de Model Request en el archivo mensual.
+   * Incluye el prompt completo enviado al modelo.
+   */
+  static logModelRequest(
+    prompt: string,
+    dbName?: string,
+    metadata?: Record<string, unknown>,
+  ): void {
     try {
       this.ensureLogDirectory();
 
@@ -62,8 +79,34 @@ export class LogUtils {
       const date = this.getFormattedDate();
       const time = this.getFormattedTimestamp();
       const dbNamePart = dbName ? `[dbName: ${dbName}] ` : '';
-      const responseString =
-        typeof response === 'string' ? response : JSON.stringify(response);
+      const payload = {
+        prompt,
+        ...(metadata ?? {}),
+      };
+
+      const logEntry = `[${date} ${time}] ${dbNamePart}Model request sent: ${this.safeStringify(payload)}\n`;
+
+      fs.appendFileSync(logFilePath, logEntry, 'utf8');
+    } catch (error) {
+      console.error('Error writing model request to log file:', error);
+    }
+  }
+
+  /**
+   * Escribe un log de Model Response en el archivo mensual
+   * Formato: [YYYY-MM-DD HH:mm:ss] [dbName: XXX] Model response received: {response}
+   */
+  static logModelResponse(response: unknown, dbName?: string): void {
+    try {
+      this.ensureLogDirectory();
+
+      const logFileName = this.getMonthlyLogFileName();
+      const logFilePath = path.join(this.LOGS_DIR, logFileName);
+
+      const date = this.getFormattedDate();
+      const time = this.getFormattedTimestamp();
+      const dbNamePart = dbName ? `[dbName: ${dbName}] ` : '';
+      const responseString = this.safeStringify(response);
 
       const logEntry = `[${date} ${time}] ${dbNamePart}Model response received: ${responseString}\n`;
 
@@ -74,11 +117,9 @@ export class LogUtils {
   }
 
   /**
-   * Escribe un log genérico con mensaje personalizado
-   * @param message El mensaje a registrar
-   * @param data Datos adicionales opcionales
+   * Escribe un log generico con mensaje personalizado
    */
-  static log(message: string, data?: any): void {
+  static log(message: string, data?: unknown): void {
     try {
       this.ensureLogDirectory();
 
@@ -87,7 +128,7 @@ export class LogUtils {
 
       const date = this.getFormattedDate();
       const time = this.getFormattedTimestamp();
-      const dataString = data ? `: ${JSON.stringify(data)}` : '';
+      const dataString = data ? `: ${this.safeStringify(data)}` : '';
 
       const logEntry = `[${date} ${time}] ${message}${dataString}\n`;
 

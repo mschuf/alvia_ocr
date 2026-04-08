@@ -11,6 +11,7 @@ import { access, readFile } from 'node:fs/promises';
 import * as path from 'node:path';
 import { OcrResponseDto } from './dto/ocr-response.dto';
 import { FileUtils } from './utils/file.utils';
+import { GeminiCostLogUtils } from './utils/gemini-cost-log.utils';
 import { LogUtils } from './utils/log.utils';
 
 interface DaemonProcessRequest {
@@ -238,6 +239,13 @@ export class OcrService {
       const model = modelName || this.geminiModel;
       this.logger.log(`Processing with model: ${model}`);
 
+      LogUtils.logModelRequest(prompt, contextLabel, {
+        model,
+        mimeType: mimeType ?? null,
+        hasInlineData: Boolean(buffer && mimeType),
+        inlineDataBytes: buffer?.length ?? 0,
+      });
+
       const genModel = this.genAI.getGenerativeModel({
         model,
         generationConfig: {
@@ -264,15 +272,31 @@ export class OcrService {
 
       const startTime = Date.now();
       const result = await genModel.generateContentStream(content);
-      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+      const response = await result.response;
+      const elapsedMs = Date.now() - startTime;
+      const duration = (elapsedMs / 1000).toFixed(2);
 
       fs.appendFileSync(
         './logs/processing_times.log',
         `${new Date().toISOString()} - ${model}: ${duration}s\n`,
       );
 
-      const response = await result.response;
       LogUtils.logModelResponse(response, contextLabel);
+
+      const usageCost = GeminiCostLogUtils.logUsageAndCost({
+        model,
+        usageMetadata: response.usageMetadata,
+        contextLabel,
+        durationMs: elapsedMs,
+      });
+
+      if (usageCost) {
+        this.logger.log(
+          `Gemini usage/cost - model=${model}, promptTokens=${usageCost.promptTokens}, outputTokens=${usageCost.outputTokens}, totalTokens=${usageCost.totalTokens}, estimatedUsd=${usageCost.estimatedCostUsd}, totalUsd=${usageCost.totalEstimatedCostUsd}`,
+        );
+      } else {
+        this.logger.warn('No se pudo registrar usage/cost de Gemini.');
+      }
 
       const text = response.text();
       this.logger.log(`Model processing: ${duration}s`);
