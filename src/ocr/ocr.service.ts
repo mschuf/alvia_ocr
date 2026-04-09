@@ -341,37 +341,82 @@ export class OcrService {
     }
   }
 
+  private static readonly DEFAULT_PROMPT = `Eres un experto en procesamiento de facturas paraguayas. Tu tarea es corregir errores de OCR y devolver datos estructurados en formato JSON que correspondan a la tabla lk_documentos.
+
+REGLAS DE IVA:
+- DIESEL/NAFTA/COMBUSTIBLE → doc_monto_exento
+- "10%" o columna "10" → doc_monto_10 (y calcular doc_iva_10)
+- "5%" o columna "5" → doc_monto_5 (y calcular doc_iva_5)
+- Sin porcentaje explícito → doc_monto_exento
+
+CÁLCULO DE IVA:
+- doc_iva_10 = doc_monto_10 / 11
+- doc_iva_5 = doc_monto_5 / 21
+- doc_monto_total = doc_monto_10 + doc_monto_5 + doc_monto_exento
+
+IMPORTANTE - TOTALES CONSOLIDADOS:
+- NO incluir array de detalles/items
+- Sumar TODOS los montos de la factura en los campos correspondientes
+- Si hay múltiples items con IVA 10%, sumar todos en doc_monto_10
+- Si hay múltiples items con IVA 5%, sumar todos en doc_monto_5
+- Si hay múltiples items exentos, sumar todos en doc_monto_exento
+
+RUC DEL PROVEEDOR:
+- sn_ruc: RUC del emisor/proveedor de la factura
+- sn_name: Nombre del emisor/proveedor de la factura
+- Formato: #######-# (7 dígitos, guion, 1 dígito)
+- Si NO se encuentra el RUC en la factura → usar "0000000-0"
+
+FECHAS:
+- doc_fecha_emision: formato YYYY-MM-DD
+- doc_vence_timbrado: formato YYYY-MM-DD
+- doc_periodo: formato YYYYMM (ejemplo: "202502" para febrero 2025)
+
+NÚMERO DE FACTURA:
+- doc_numero: formato completo "establecimiento-punto-número" (ejemplo: "004-001-0005551")
+
+TIMBRADO:
+- doc_timbrado: número de timbrado (8 dígitos)
+
+CDC (para facturas electrónicas):
+- doc_cdc: código de control de 44 caracteres si existe, sino vacío ""
+
+MONEDA:
+- PYG → sin decimales (números enteros)
+
+ESTRUCTURA JSON A DEVOLVER (PLANA, SIN ARRAYS):
+{
+  "sn_id_fiscal": "80075646-0",
+  "sn_name": "Comercial Villalba",
+  "doc_numero": "004-001-0005551",
+  "doc_fecha_emision": "2025-09-04",
+  "doc_timbrado": 18181496,
+  "doc_vence_timbrado": "2025-12-31",
+  "doc_periodo": "202509",
+  "doc_cdc": "",
+  "doc_monto_10": 181818,
+  "doc_iva_10": 18182,
+  "doc_monto_5": 0,
+  "doc_iva_5": 0,
+  "doc_monto_exento": 0,
+  "doc_monto_total": 200000
+}
+
+INSTRUCCIONES CRÍTICAS:
+1. Devuelve ÚNICAMENTE JSON VÁLIDO
+2. NO incluyas arrays como "detalles", "items" o "DocumentLines"
+3. TODOS los montos deben estar consolidados en los campos principales
+4. Sin explicaciones, sin texto adicional, sin markdown, sin comentarios
+5. La estructura debe ser completamente PLANA (un solo nivel de objetos)
+6. Incluye SOLAMENTE los campos mostrados en el ejemplo`;
+
   private async generatePrompt(empresaId?: number): Promise<string> {
     let customPrompt: string | null = null;
     if (empresaId) {
       customPrompt = await this.fetchCustomPrompt(empresaId);
     }
 
-    const basePrompt = `Analiza esta factura paraguaya y extrae datos en JSON valido.
-
-CAMPOS REQUERIDOS:
-- invoiceNumber
-- establecimiento
-- punto_emision
-- supplierRuc
-- supplierName
-- CardCode
-- CardName
-- DocDate
-- DocDueDate
-- DocCurrency
-- DocTotal
-- TaxDate
-- U_TIMB
-- U_TimbradoStart
-- U_TimbradoEnd
-- U_TipoFactura
-- PaymentGroupCode
-- DocumentLines
-
-RESPONDE SOLO JSON VALIDO.`;
-
-    return customPrompt || basePrompt;
+    return customPrompt || OcrService.DEFAULT_PROMPT;
   }
 
   private cleanJsonResponse(jsonString: string): string {
