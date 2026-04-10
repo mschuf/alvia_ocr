@@ -53,6 +53,12 @@ const MODEL_DEFAULT_PRICING: Record<string, PricingConfig> = {
     outputUsdPer1M: 3,
     cachedInputUsdPer1M: 0.05,
   },
+  // Fuente (2026-04-10): https://ai.google.dev/gemini-api/docs/pricing (Standard paid tier, prompts <= 200k)
+  'gemini-3.1-pro-preview': {
+    inputUsdPer1M: 2,
+    outputUsdPer1M: 12,
+    cachedInputUsdPer1M: 0.2,
+  },
   // Fuente (2026-04-07): https://ai.google.dev/pricing (Standard paid tier)
   'gemini-2.5-flash': {
     inputUsdPer1M: 0.3,

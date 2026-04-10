@@ -16,7 +16,7 @@ export class ProcessDaemonOcrDto {
   })
   @IsString()
   @IsNotEmpty()
-  documento: string;
+  documento!: string;
 
   @ApiProperty({
     description: 'ID de empresa obligatorio para contexto de OCR.',
@@ -24,14 +24,14 @@ export class ProcessDaemonOcrDto {
   })
   @IsInt()
   @Min(1)
-  empresaId: number;
+  empresaId!: number;
 
   @ApiProperty({
     description: 'Prompt final que debe usar OCR para procesar el documento.',
   })
   @IsString()
   @IsNotEmpty()
-  prompt: string;
+  prompt!: string;
 
   @ApiPropertyOptional({
     description: 'ID del documento origen para trazabilidad en logs.',
@@ -43,7 +43,8 @@ export class ProcessDaemonOcrDto {
   documentId?: number;
 
   @ApiPropertyOptional({
-    description: 'Cuando true, OCR puede usar un modelo más lento/preciso.',
+    description:
+      'Cuando true, OCR intenta primero el modelo fallback más preciso antes de volver al primario.',
     default: false,
   })
   @IsOptional()

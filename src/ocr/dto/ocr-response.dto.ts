@@ -5,32 +5,32 @@ export class DocumentLineDto {
     description: 'Descripción del producto o servicio',
     example: 'Consultoría en sistemas',
   })
-  ItemDescription: string;
+  ItemDescription!: string;
 
   @ApiProperty({
     description: 'Cantidad',
     example: 2,
   })
-  Quantity: number;
+  Quantity!: number;
 
   @ApiProperty({
     description: 'Precio unitario',
     example: 500000,
   })
-  UnitPrice: number;
+  UnitPrice!: number;
 
   @ApiProperty({
     description: 'Total de la línea',
     example: 1000000,
   })
-  LineTotal: number;
+  LineTotal!: number;
 
   @ApiProperty({
     description: 'Código de impuesto',
     example: 'IVA_10',
     enum: ['IVA_10', 'IVA_5', 'IVA_Exe'],
   })
-  TaxCode: string;
+  TaxCode!: string;
 }
 
 export class OcrResponseDto {
@@ -235,5 +235,5 @@ export class OcrResponseDto {
     description: 'Marca de tiempo de procesamiento',
     example: '2023-12-01T10:30:00.000Z',
   })
-  timestamp: string;
+  timestamp!: string;
 }

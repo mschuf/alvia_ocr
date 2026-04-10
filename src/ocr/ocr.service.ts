@@ -28,21 +28,34 @@ interface ResolvedDocumentInput {
   source: 'data_uri' | 'url' | 'file_path' | 'base64_text';
 }
 
+interface OcrAttemptParams {
+  prompt: string;
+  buffer?: Buffer;
+  mimeType?: string;
+  contextLabel?: string;
+  preferFallbackFirst?: boolean;
+}
+
 @Injectable()
 export class OcrService {
   private readonly logger = new Logger(OcrService.name);
   private readonly genAI: GoogleGenerativeAI;
 
   // Se mantienen modelos internos del OCR, no del daemon.
-  private readonly geminiModel = 'gemini-3-flash-preview';
-  private readonly geminiSlowModel = 'gemini-2.5-flash';
+  private readonly geminiPrimaryModel =
+    process.env.GEMINI_PRIMARY_MODEL?.trim() || 'gemini-3-flash-preview';
+  private readonly geminiFallbackModel =
+    process.env.GEMINI_FALLBACK_MODEL?.trim() || 'gemini-3.1-pro-preview';
   private readonly maxFileSizeBytes = 50 * 1024 * 1024;
 
   constructor() {
     try {
-      const apiKey = process.env.GEMINI3_FLASH_API_KEY || '';
+      const apiKey =
+        process.env.GEMINI_API_KEY || process.env.GEMINI3_FLASH_API_KEY || '';
       if (!apiKey) {
-        throw new Error('GEMINI3_FLASH_API_KEY not configured');
+        throw new Error(
+          'GEMINI_API_KEY or GEMINI3_FLASH_API_KEY not configured',
+        );
       }
 
       this.genAI = new GoogleGenerativeAI(apiKey);
@@ -51,8 +64,8 @@ export class OcrService {
       FileUtils.createDirectoryIfNotExists('./logs');
 
       this.logger.log('OCR Service initialized successfully');
-      this.logger.log(`Fast Model: ${this.geminiModel}`);
-      this.logger.log(`Slow Model: ${this.geminiSlowModel}`);
+      this.logger.log(`Primary Model: ${this.geminiPrimaryModel}`);
+      this.logger.log(`Fallback Model: ${this.geminiFallbackModel}`);
     } catch (error) {
       this.logger.error('Failed to initialize Google clients', error);
       throw new InternalServerErrorException(
@@ -83,22 +96,19 @@ export class OcrService {
     const resolvedInput = await this.resolveDocumentInput(documentValue);
     this.validateBufferSize(resolvedInput.buffer.length);
 
-    const modelToUse = useSlowModel ? this.geminiSlowModel : this.geminiModel;
     const contextLabel = `daemon:empresaId:${empresaId},documentId:${documentId ?? 'N/A'},source:${resolvedInput.source}`;
 
     this.logger.log(
       `Processing daemon OCR request with ${resolvedInput.source}, mime=${resolvedInput.mimeType}, bytes=${resolvedInput.buffer.length}`,
     );
 
-    const text = await this.processWithGemini(
+    const extractedData = await this.processWithModelFallback({
       prompt,
-      resolvedInput.buffer,
-      resolvedInput.mimeType,
-      modelToUse,
+      buffer: resolvedInput.buffer,
+      mimeType: resolvedInput.mimeType,
       contextLabel,
-    );
-
-    const extractedData = this.parseGeminiResponse(text);
+      preferFallbackFirst: useSlowModel,
+    });
     extractedData.timestamp = new Date().toISOString();
     extractedData.empresaId = empresaId;
 
@@ -133,17 +143,16 @@ export class OcrService {
         uploadedMimeType,
       );
       const prompt = await this.generatePrompt(empresaId);
-      const modelToUse = useSlowModel ? this.geminiSlowModel : this.geminiModel;
 
-      const text = await this.processWithGemini(
+      const extractedData = await this.processWithModelFallback({
         prompt,
-        fileBuffer,
+        buffer: fileBuffer,
         mimeType,
-        modelToUse,
-        empresaId ? `file:empresaId:${empresaId}` : 'file:empresaId:N/A',
-      );
-
-      const extractedData = this.parseGeminiResponse(text);
+        contextLabel: empresaId
+          ? `file:empresaId:${empresaId}`
+          : 'file:empresaId:N/A',
+        preferFallbackFirst: useSlowModel,
+      });
       extractedData.timestamp = new Date().toISOString();
 
       await FileUtils.deleteFile(filePath);
@@ -172,15 +181,12 @@ export class OcrService {
       this.validateBufferSize(imageBuffer.length);
 
       const prompt = await this.generatePrompt();
-      const text = await this.processWithGemini(
+      const extractedData = await this.processWithModelFallback({
         prompt,
-        imageBuffer,
-        'image/jpeg',
-        this.geminiModel,
-        'image:empresaId:N/A',
-      );
-
-      const extractedData = this.parseGeminiResponse(text);
+        buffer: imageBuffer,
+        mimeType: 'image/jpeg',
+        contextLabel: 'image:empresaId:N/A',
+      });
       extractedData.timestamp = new Date().toISOString();
 
       const duration = ((Date.now() - startTime) / 1000).toFixed(2);
@@ -228,6 +234,54 @@ export class OcrService {
     }
   }
 
+  private async processWithModelFallback(
+    params: OcrAttemptParams,
+  ): Promise<Record<string, unknown>> {
+    const models = this.resolveModelAttemptOrder(
+      params.preferFallbackFirst ?? false,
+    );
+    const errors: string[] = [];
+
+    for (const [index, model] of models.entries()) {
+      try {
+        const text = await this.processWithGemini(
+          params.prompt,
+          params.buffer,
+          params.mimeType,
+          model,
+          params.contextLabel
+            ? `${params.contextLabel},attempt:${index + 1}`
+            : `attempt:${index + 1}`,
+        );
+
+        const extractedData = this.parseGeminiResponse(text);
+
+        if (index > 0) {
+          this.logger.warn(
+            `OCR fallback successful with ${model} after previous failures: ${errors.join(' | ')}`,
+          );
+        }
+
+        return extractedData;
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : 'Unknown error';
+        errors.push(`${model}: ${message}`);
+
+        if (index < models.length - 1) {
+          this.logger.warn(
+            `OCR attempt failed with ${model}. Trying fallback model. Reason: ${message}`,
+          );
+          continue;
+        }
+      }
+    }
+
+    throw new InternalServerErrorException(
+      `All OCR model attempts failed: ${errors.join(' | ')}`,
+    );
+  }
+
   private async processWithGemini(
     prompt: string,
     buffer?: Buffer,
@@ -236,7 +290,7 @@ export class OcrService {
     contextLabel?: string,
   ): Promise<string> {
     try {
-      const model = modelName || this.geminiModel;
+      const model = modelName || this.geminiPrimaryModel;
       this.logger.log(`Processing with model: ${model}`);
 
       LogUtils.logModelRequest(prompt, contextLabel, {
@@ -309,6 +363,17 @@ export class OcrService {
         `Failed to process with model: ${errorMessage}`,
       );
     }
+  }
+
+  private resolveModelAttemptOrder(preferFallbackFirst: boolean): string[] {
+    const orderedModels = preferFallbackFirst
+      ? [this.geminiFallbackModel, this.geminiPrimaryModel]
+      : [this.geminiPrimaryModel, this.geminiFallbackModel];
+
+    return orderedModels.filter(
+      (model, index, models) =>
+        model.length > 0 && models.indexOf(model) === index,
+    );
   }
 
   private async fetchCustomPrompt(empresaId: number): Promise<string | null> {
