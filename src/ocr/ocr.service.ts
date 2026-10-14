@@ -1,5 +1,7 @@
 import {
   BadRequestException,
+  GatewayTimeoutException,
+  HttpException,
   Injectable,
   InternalServerErrorException,
   Logger,
@@ -13,6 +15,8 @@ import { OcrResponseDto } from './dto/ocr-response.dto';
 import { FileUtils } from './utils/file.utils';
 import { GeminiCostLogUtils } from './utils/gemini-cost-log.utils';
 import { LogUtils } from './utils/log.utils';
+import { groundOcrFields, OCR_GROUNDING_RULES } from './utils/ocr-grounding';
+import { withOcrDeadline } from './utils/ocr-deadline';
 
 interface DaemonProcessRequest {
   documentValue: string;
@@ -197,6 +201,7 @@ export class OcrService {
       const errorMessage =
         error instanceof Error ? error.message : 'Unknown error';
       this.logger.error(`Error processing invoice image: ${errorMessage}`);
+      if (error instanceof HttpException) throw error;
       throw new InternalServerErrorException(
         `Error processing invoice: ${errorMessage}`,
       );
@@ -241,20 +246,27 @@ export class OcrService {
       params.preferFallbackFirst ?? false,
     );
     const errors: string[] = [];
+    const deadline = Date.now() + 80_000;
+    let timedOut = false;
 
     for (const [index, model] of models.entries()) {
       try {
         const text = await this.processWithGemini(
-          params.prompt,
+          `${params.prompt}\n${OCR_GROUNDING_RULES}`,
           params.buffer,
           params.mimeType,
           model,
           params.contextLabel
             ? `${params.contextLabel},attempt:${index + 1}`
             : `attempt:${index + 1}`,
+          Math.max(1, Math.min(40_000, deadline - Date.now())),
         );
 
-        const extractedData = this.parseGeminiResponse(text);
+        const parsed = this.parseGeminiResponse(text);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new Error('El OCR no devolvió un objeto de datos válido.');
+        }
+        const extractedData = groundOcrFields(parsed);
 
         if (index > 0) {
           this.logger.warn(
@@ -264,6 +276,7 @@ export class OcrService {
 
         return extractedData;
       } catch (error) {
+        timedOut ||= error instanceof GatewayTimeoutException;
         const message =
           error instanceof Error ? error.message : 'Unknown error';
         errors.push(`${model}: ${message}`);
@@ -277,6 +290,10 @@ export class OcrService {
       }
     }
 
+    if (timedOut)
+      throw new GatewayTimeoutException(
+        'El servicio OCR superó el tiempo máximo de procesamiento.',
+      );
     throw new InternalServerErrorException(
       `All OCR model attempts failed: ${errors.join(' | ')}`,
     );
@@ -288,6 +305,7 @@ export class OcrService {
     mimeType?: string,
     modelName?: string,
     contextLabel?: string,
+    timeoutMs = 40_000,
   ): Promise<string> {
     try {
       const model = modelName || this.geminiPrimaryModel;
@@ -325,8 +343,12 @@ export class OcrService {
           : prompt;
 
       const startTime = Date.now();
-      const result = await genModel.generateContentStream(content);
-      const response = await result.response;
+      const response = await withOcrDeadline(async (signal) => {
+        const result = await genModel.generateContentStream(content, {
+          signal,
+        });
+        return result.response;
+      }, timeoutMs);
       const elapsedMs = Date.now() - startTime;
       const duration = (elapsedMs / 1000).toFixed(2);
 
@@ -359,6 +381,7 @@ export class OcrService {
       const errorMessage =
         error instanceof Error ? error.message : 'Unknown error';
       this.logger.error(`Model failed: ${errorMessage}`);
+      if (error instanceof HttpException) throw error;
       throw new InternalServerErrorException(
         `Failed to process with model: ${errorMessage}`,
       );
@@ -381,23 +404,18 @@ export class OcrService {
       this.logger.log(`Fetching custom prompt for empresaId: ${empresaId}`);
       const baseUrl = process.env.API_BASE_URL || 'http://localhost:3003';
 
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3000);
-
-      const response = await fetch(
-        `${baseUrl}/prompts/active-by-empresa/${empresaId}`,
-        { signal: controller.signal },
-      );
-
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        this.logger.warn(`Custom prompt fetch failed: ${response.status}`);
-        return null;
-      }
-
-      const data = (await response.json()) as Record<string, unknown>;
-      return typeof data.prompt === 'string' ? data.prompt : null;
+      return await withOcrDeadline(async (signal) => {
+        const response = await fetch(
+          `${baseUrl}/prompts/active-by-empresa/${empresaId}`,
+          { signal },
+        );
+        if (!response.ok) {
+          this.logger.warn(`Custom prompt fetch failed: ${response.status}`);
+          return null;
+        }
+        const data = (await response.json()) as Record<string, unknown>;
+        return typeof data.prompt === 'string' ? data.prompt : null;
+      }, 3_000);
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : 'Unknown error';
@@ -430,7 +448,7 @@ RUC DEL PROVEEDOR:
 - sn_ruc: RUC del emisor/proveedor de la factura
 - sn_name: Nombre del emisor/proveedor de la factura
 - Formato: #######-# (7 dígitos, guion, 1 dígito)
-- Si NO se encuentra el RUC en la factura → usar "0000000-0"
+- Si NO se encuentra el RUC en la factura → devolver null
 
 FECHAS:
 - doc_fecha_emision: formato YYYY-MM-DD
@@ -456,7 +474,8 @@ ESTRUCTURA JSON A DEVOLVER (PLANA, SIN ARRAYS):
   "doc_numero": "004-001-0005551",
   "doc_fecha_emision": "2025-09-04",
   "doc_timbrado": 18181496,
-  "doc_vence_timbrado": "2025-12-31",
+  "doc_vence_timbrado": null,
+  "doc_vence_timbrado_evidencia": null,
   "doc_periodo": "202509",
   "doc_cdc": "",
   "doc_monto_10": 181818,
@@ -528,24 +547,26 @@ INSTRUCCIONES CRÍTICAS:
     }
 
     if (/^https?:\/\//i.test(trimmed)) {
-      const response = await fetch(trimmed);
-      if (!response.ok) {
-        throw new BadRequestException(
-          `No se pudo descargar documento URL (${response.status})`,
-        );
-      }
+      return withOcrDeadline(async (signal) => {
+        const response = await fetch(trimmed, { signal });
+        if (!response.ok) {
+          throw new BadRequestException(
+            `No se pudo descargar documento URL (${response.status})`,
+          );
+        }
 
-      const mimeType = (
-        response.headers.get('content-type') ?? 'application/pdf'
-      )
-        .split(';')[0]
-        .trim();
+        const mimeType = (
+          response.headers.get('content-type') ?? 'application/pdf'
+        )
+          .split(';')[0]
+          .trim();
 
-      return {
-        mimeType,
-        buffer: Buffer.from(await response.arrayBuffer()),
-        source: 'url',
-      };
+        return {
+          mimeType,
+          buffer: Buffer.from(await response.arrayBuffer()),
+          source: 'url',
+        };
+      }, 15_000);
     }
 
     if (await this.pathExists(trimmed)) {
